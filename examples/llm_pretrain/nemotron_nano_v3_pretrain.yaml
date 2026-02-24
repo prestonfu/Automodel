@@ -125,6 +125,7 @@ lr_scheduler:
   min_lr: 0.0
 
 wandb:
+  wandb_online: true
   project: nemotron_nano_v3_pretrain
   entity: prestonfu
   name: nemotron_nano_v3_pretrain

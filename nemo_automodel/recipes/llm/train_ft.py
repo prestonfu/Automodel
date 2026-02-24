@@ -740,6 +740,8 @@ def build_wandb(cfg) -> wandb.Run:
     kwargs = cfg.wandb.to_dict()
     if kwargs.get("name", "") == "":
         kwargs["name"] = "_".join(_get_model_name(cfg.model).split("/")[-2:])
+    if not kwargs.pop("wandb_online", True):
+        kwargs["mode"] = "offline"
     run = wandb.init(
         **kwargs,
         config=cfg.to_dict(),
@@ -1219,13 +1221,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # Run validation every val_every_steps
                 val_losses = {}
                 if self.step_scheduler.is_val_step:
-                    if self.pp_enabled:
-                        logger.warning("Validation is not supported for pipeline parallelism")
-                    else:
-                        for val_name, val_dataloader in self.val_dataloaders.items():
-                            val_log_data = self._run_validation_epoch(val_dataloader)
-                            val_losses[val_name] = val_log_data.metrics["val_loss"]
-                            self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
+                    for val_name, val_dataloader in self.val_dataloaders.items():
+                        val_log_data = self._run_validation_epoch(val_dataloader)
+                        val_losses[val_name] = val_log_data.metrics["val_loss"]
+                        self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
                     for mp in self.model_parts:
                         mp.train()
 
@@ -1275,10 +1274,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         labels = batch.pop("labels")
 
         if self.pp_enabled:
-            if not is_train:
-                logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")
-                return
-
             with train_ctx():
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
@@ -1288,10 +1283,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     targets = None
 
                 input_ids = batch.pop("input_ids")
+                schedule_fn = self.pp.info.schedule.step if is_train else self.pp.info.schedule.eval
                 if self.pp.info.has_first_stage:
-                    self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
+                    schedule_fn(input_ids, target=targets, losses=losses, **batch)
                 else:
-                    self.pp.info.schedule.step(target=targets, losses=losses, **batch)
+                    schedule_fn(target=targets, losses=losses, **batch)
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))
@@ -1484,6 +1480,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         total_loss = self._dp_allreduce(total_loss, include_cp=True).item()
         total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
+
+        # Send loss from last PP stage to rank 0 (mirrors training path at lines 1414-1422)
+        if self.pp_enabled:
+            total_loss_tensor = torch.tensor(total_loss, dtype=torch.float32, device=self.dist_env.device)
+            src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
+            if self.dist_env.rank == src_rank:
+                torch.distributed.send(total_loss_tensor, dst=0)
+            elif self.dist_env.is_main:
+                torch.distributed.recv(total_loss_tensor, src=src_rank)
+            total_loss = total_loss_tensor.item()
+
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
 
         return MetricsSample(

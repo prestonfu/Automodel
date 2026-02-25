@@ -26,6 +26,8 @@ import glob
 import multiprocessing
 import time
 
+from tqdm import tqdm
+
 try:
     import nltk
     from nltk.tokenize.punkt import PunktLanguageVars
@@ -215,7 +217,8 @@ class Partition(object):
 
     def process_parquet_file(self, file_name):
         input_file_name, output_prefix = file_name
-        print("Opening parquet file:", input_file_name)
+        parquet_file = pq.ParquetFile(input_file_name)
+        total_rows = parquet_file.metadata.num_rows
 
         startup_start = time.time()
         encoder = Encoder(self.args)
@@ -245,14 +248,13 @@ class Partition(object):
             )
 
         startup_end = time.time()
-        proc_start = time.time()
-        total_bytes_processed = 0
         print("Time to startup:", startup_end - startup_start)
-        for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
-            total_bytes_processed += bytes_processed
+        basename = os.path.basename(input_file_name)
+        pbar = tqdm(encoded_docs, total=total_rows, desc=basename,
+                    position=self.args.tqdm_position, leave=True, dynamic_ncols=True, unit=" docs")
+        for doc, sentence_lens, bytes_processed in pbar:
             for key in doc.keys():
                 builders[key].add_document(doc[key], sentence_lens[key])
-            self.print_processing_stats(i, proc_start, total_bytes_processed, source=input_file_name)
 
         pool.close()
         pool.join()
@@ -312,6 +314,7 @@ def get_args():
         help=("Number of worker processes to launch. Workers are divided across matched input files."),
     )
     group.add_argument("--log-interval", type=int, default=1000, help="Interval between progress updates")
+    group.add_argument("--tqdm-position", type=int, default=0, help="tqdm bar position (for parallel processes)")
     group.add_argument("--pretrained-model-name-or-path", type=str, required=True, help="Pretrained model name or path")
     args = parser.parse_args()
     return args

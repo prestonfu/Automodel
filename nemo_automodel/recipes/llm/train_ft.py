@@ -1561,17 +1561,39 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
+        log_dict = log_data.to_dict()
+        max_steps = getattr(self.step_scheduler, "max_steps", None)
+        eta_seconds = None
+        if max_steps is not None and log_data.metrics.get("tps", 0) > 0:
+            remaining_steps = max_steps - log_data.step
+            if remaining_steps > 0 and "num_tokens_per_step" in log_data.metrics:
+                time_per_step = log_data.metrics["num_tokens_per_step"] / log_data.metrics["tps"]
+                eta_seconds = remaining_steps * time_per_step
+                log_dict["eta_seconds"] = eta_seconds
+
         if wandb.run is not None:
-            wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            wandb.log(log_dict, step=self.step_scheduler.step)
 
         if self.mlflow_logger is not None:
-            self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
+            self.mlflow_logger.log_metrics(log_dict, step=log_data.step)
 
-        # JSONL training log
+        # JSONL training log (include eta_seconds when available)
+        if eta_seconds is not None:
+            from dataclasses import replace
+
+            log_data = replace(log_data, metrics={**log_data.metrics, "eta_seconds": eta_seconds})
         self.metric_logger_train.log(log_data)
         mfu_str = " | mfu {:.2f}%".format(log_data.metrics["mfu"]) if "mfu" in log_data.metrics else ""
+        eta_str = ""
+        if eta_seconds is not None:
+            if eta_seconds >= 3600:
+                eta_str = " | eta {:.1f}h".format(eta_seconds / 3600)
+            elif eta_seconds >= 60:
+                eta_str = " | eta {:.1f}m".format(eta_seconds / 60)
+            else:
+                eta_str = " | eta {:.0f}s".format(eta_seconds)
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}{}".format(
+            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}{}{}".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
@@ -1582,6 +1604,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 log_data.metrics["tps_per_gpu"],
                 log_data.metrics["num_label_tokens"],
                 mfu_str,
+                eta_str,
             )
         )
         torch.cuda.reset_peak_memory_stats()

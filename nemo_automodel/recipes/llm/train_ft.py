@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 import wandb
 from torch.distributed.device_mesh import DeviceMesh
 from torch.utils.data import DataLoader, IterableDataset
@@ -1015,6 +1017,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.router_aux_loss_coef > 0:
             logging.info("MoE load balancing enabled: router_aux_loss_coef=%.4f", self.router_aux_loss_coef)
 
+        # Logging frequency (default: every step)
+        self.log_every_steps = int(self.cfg.get("log_every_steps", 1))
+
         # Create Checkpointer instance
         self.checkpointer = Checkpointer(
             config=checkpoint_config,
@@ -1142,29 +1147,63 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self._register_expert_load_hooks()
 
     def _register_expert_load_hooks(self):
-        """Register forward hooks on HF MoE routers to track expert load."""
+        """Register forward hooks on NemotronHMOE blocks to track expert load and inject aux loss."""
         count = 0
         for part in self.model_parts:
             for module in part.modules():
-                if type(module).__name__ == "NemotronHTopkRouter":
+                if type(module).__name__ == "NemotronHMOE":
+                    # NemotronHTopkRouter.weight is a raw nn.Parameter (not nn.Linear),
+                    # so HF's _init_weights never touches it.  After meta-device
+                    # materialisation it remains all-zeros, making every sigmoid score
+                    # identical (0.5) and collapsing routing to a fixed set of experts.
+                    gate = module.gate
+                    if hasattr(gate, "weight") and gate.weight.data.abs().max() == 0:
+                        init_std = getattr(gate.config, "initializer_range", 0.02)
+                        nn.init.normal_(gate.weight, mean=0.0, std=init_std)
+                        logging.info("Initialized NemotronHTopkRouter.weight with normal_(0, %.4f)", init_std)
                     module._cumulative_expert_load = None
-                    module.register_forward_hook(self._expert_load_hook)
+                    module.register_forward_hook(
+                        partial(self._moe_block_hook, router_aux_loss_coef=self.router_aux_loss_coef)
+                    )
                     count += 1
         if count > 0:
-            logging.info("Registered expert load hooks on %d NemotronHTopkRouter modules", count)
+            logging.info("Registered expert load + aux_loss hooks on %d NemotronHMOE modules", count)
 
     @staticmethod
-    def _expert_load_hook(module, input, output):
-        """Forward hook that accumulates expert load from router outputs."""
-        topk_idx, topk_weight = output
-        n_experts = module.n_routed_experts
-        expert_mask = topk_idx.new_zeros(topk_idx.shape[0], n_experts)
-        expert_mask.scatter_(1, topk_idx, 1)
-        expert_load = expert_mask.sum(dim=0).float()
+    def _moe_block_hook(module, input, output, router_aux_loss_coef):
+        """Forward hook on MoE block: tracks expert load and injects aux loss gradient."""
+        if not torch.is_grad_enabled():
+            return
+        hidden_states = input[0]
+        gate = module.gate
+        hs_flat = hidden_states.view(-1, gate.config.hidden_size)
+        n_tokens = hs_flat.shape[0]
+        n_experts = gate.n_routed_experts
+
+        router_logits = F.linear(hs_flat.to(gate.weight.dtype), gate.weight)
+        scores = router_logits.sigmoid()
+
+        with torch.no_grad():
+            topk_indices = gate.get_topk_indices(scores)
+            expert_mask = topk_indices.new_zeros(n_tokens, n_experts)
+            expert_mask.scatter_(1, topk_indices, 1)
+            expert_load = expert_mask.sum(dim=0).float()
+
+        # Accumulate expert load for CV metric
         if module._cumulative_expert_load is None:
-            module._cumulative_expert_load = expert_load.detach()
+            module._cumulative_expert_load = expert_load
         else:
-            module._cumulative_expert_load += expert_load.detach()
+            module._cumulative_expert_load += expert_load
+
+        # Switch-style aux loss: n_experts * sum(f_i * P_i)
+        f = (expert_load / n_tokens).detach()
+        P = scores.mean(dim=0)
+        aux_loss = n_experts * torch.sum(f * P)
+
+        # Inject gradient
+        scaled = aux_loss * router_aux_loss_coef
+        output = output + (scaled - scaled.detach())
+        return output
 
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
@@ -1247,8 +1286,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # If QAT delayed fake-quant is configured, enable after threshold
                 self._enable_qat_if_delayed(step)
                 train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                # log
-                self.log_train_metrics(train_log_data)
+                # log (respects log_every_steps frequency)
+                if self.step_scheduler.step % self.log_every_steps == 0:
+                    self.log_train_metrics(train_log_data)
 
                 # nsys profiling: stop
                 if _nsys_active and _nsys_end >= 0 and step == _nsys_end and self.dist_env.rank in _nsys_ranks:
@@ -1292,8 +1332,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_label_tokens,
         num_batches,
         is_train: bool = True,
-        ce_loss_buffer=None,
-        aux_loss_buffer=None,
     ):
         # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
         batch = {
@@ -1365,21 +1403,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
                     num_label_tokens=num_label_tokens,
                 )
-                aux_loss_scaled = None
-                if self.router_aux_loss_coef > 0 and getattr(out, "aux_loss", None) is not None:
-                    aux_loss_scaled = self.router_aux_loss_coef * out.aux_loss
-                    local_loss = ce_loss + aux_loss_scaled
-                else:
-                    local_loss = ce_loss
+                local_loss = ce_loss
                 loss_buffer.append(local_loss.clone().detach())
-                if ce_loss_buffer is not None:
-                    ce_loss_buffer.append(ce_loss.clone().detach())
-                if aux_loss_buffer is not None:
-                    aux_loss_buffer.append(
-                        aux_loss_scaled.clone().detach()
-                        if aux_loss_scaled is not None
-                        else torch.tensor(0.0, device=ce_loss.device, dtype=ce_loss.dtype)
-                    )
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
@@ -1407,9 +1432,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_batches = len(batches)
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
-        ce_loss_buffer = [] if self.router_aux_loss_coef > 0 and not self.pp_enabled else None
-        aux_loss_buffer = [] if self.router_aux_loss_coef > 0 and not self.pp_enabled else None
-
         for i, batch in enumerate(batches):
             if i == num_batches - 1:
                 prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
@@ -1420,8 +1442,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 loss_buffer=loss_buffer,
                 num_label_tokens=num_label_tokens,
                 num_batches=num_batches,
-                ce_loss_buffer=ce_loss_buffer,
-                aux_loss_buffer=aux_loss_buffer,
             )
 
         grad_norm = scale_grads_and_clip_grad_norm(
@@ -1488,19 +1508,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         reporting_loss = reporting_loss.cpu().item()
 
-        reporting_ce_loss = None
-        reporting_aux_loss = None
-        if ce_loss_buffer is not None and aux_loss_buffer is not None:
-            reporting_ce_loss = torch.sum(torch.stack(ce_loss_buffer))
-            reporting_aux_loss = torch.sum(torch.stack(aux_loss_buffer))
-            reporting_ce_loss = self._dp_allreduce(reporting_ce_loss, include_cp=True)
-            reporting_aux_loss = self._dp_allreduce(reporting_aux_loss, include_cp=True)
-            if self.pp_enabled:
-                reporting_ce_loss = reporting_ce_loss / num_label_tokens
-                reporting_aux_loss = reporting_aux_loss / num_label_tokens
-            reporting_ce_loss = reporting_ce_loss.cpu().item()
-            reporting_aux_loss = reporting_aux_loss.cpu().item()
-
         self._total_tokens_trained += num_tokens_in_batch
         metrics = {
             "loss": reporting_loss,
@@ -1514,12 +1521,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "num_label_tokens": num_label_tokens,
             "total_tokens_trained": self._total_tokens_trained,
         }
-        if reporting_ce_loss is not None and reporting_aux_loss is not None:
-            metrics["loss_ce"] = reporting_ce_loss
-            metrics["loss_aux"] = reporting_aux_loss
-
         # MoE expert load balance metrics (works with PP — reads from local model parts)
-        # Supports both nemo_automodel Gate and HF NemotronHTopkRouter (via forward hooks)
         if self.router_aux_loss_coef > 0:
             load_cvs = []
             expert_loads = []
@@ -1527,15 +1529,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 for module in part.modules():
                     if getattr(module, '_cumulative_expert_load', None) is not None:
                         load = module._cumulative_expert_load.float()
-                        cv = load.std() / (load.mean() + 1e-8)
-                        load_cvs.append(cv.item())
+                        load_cvs.append((load.std() / (load.mean() + 1e-8)).item())
                         expert_loads.append(load)
                         module._cumulative_expert_load = None
             if load_cvs:
                 metrics["expert_load_cv"] = sum(load_cvs) / len(load_cvs)
-            if expert_loads and self.step_scheduler.step % 50 == 0 and wandb.run is not None:
-                avg_load = torch.stack(expert_loads).mean(dim=0)
-                wandb.log({"expert_load_histogram": wandb.Histogram(avg_load.cpu().numpy())}, step=self.step_scheduler.step)
+            if expert_loads:
+                metrics["_expert_load_tensor"] = torch.stack(expert_loads).mean(dim=0).cpu().tolist()
 
         if getattr(self, "_bench_tflops", None) is not None and getattr(self, "_bench_cfg", None) is not None:
             peak_tflops = self._bench_cfg.get("peak_tflops", None)
@@ -1672,7 +1672,28 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 log_dict["eta_seconds"] = eta_seconds
 
         if wandb.run is not None:
-            wandb.log(log_dict, step=self.step_scheduler.step)
+            internal_keys = {"_expert_load_tensor"}
+            perf_keys = {"tps", "tps_per_gpu", "step_time", "mem", "mfu",
+                         "num_tokens_per_step", "num_label_tokens",
+                         "total_tokens_trained", "eta_seconds"}
+            wandb_dict = {}
+            for k, v in log_dict.items():
+                if k in internal_keys:
+                    continue
+                elif k in perf_keys:
+                    wandb_dict[f"perf/{k}"] = v
+                else:
+                    wandb_dict[k] = v
+            # Expert load histogram + min/max
+            expert_load = log_data.metrics.get("_expert_load_tensor", None)
+            if expert_load is not None:
+                load_np = np.array(expert_load)
+                wandb_dict["expert_load_histogram"] = wandb.Histogram(load_np)
+                wandb_dict["expert_load_min"] = float(load_np.min())
+                wandb_dict["expert_load_mean"] = float(load_np.mean())
+                wandb_dict["expert_load_median"] = float(np.median(load_np))
+                wandb_dict["expert_load_max"] = float(load_np.max())
+            wandb.log(wandb_dict, step=self.step_scheduler.step)
 
         if self.mlflow_logger is not None:
             self.mlflow_logger.log_metrics(log_dict, step=log_data.step)
@@ -1684,22 +1705,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             log_data = replace(log_data, metrics={**log_data.metrics, "eta_seconds": eta_seconds})
         self.metric_logger_train.log(log_data)
         mfu_str = " | mfu {:.2f}%".format(log_data.metrics["mfu"]) if "mfu" in log_data.metrics else ""
-        loss_breakdown_str = ""
-        if "loss_ce" in log_data.metrics and "loss_aux" in log_data.metrics:
-            loss_breakdown_str = " | loss_ce {:.4f} | loss_aux {:.4f}".format(
-                log_data.metrics["loss_ce"], log_data.metrics["loss_aux"]
-            )
         step_time_str = " | step_time {:.2f}s".format(log_data.metrics["step_time"]) if "step_time" in log_data.metrics else ""
         expert_cv_str = " | expert_cv {:.2f}".format(log_data.metrics["expert_load_cv"]) if "expert_load_cv" in log_data.metrics else ""
         tps = log_data.metrics["tps"]
         tps_per_gpu = log_data.metrics["tps_per_gpu"]
         tps_str = "tps {:.2f}({:.2f}/gpu)".format(tps, tps_per_gpu) if tps != tps_per_gpu else "tps {:.2f}".format(tps)
         logging.info(
-            "step {} | epoch {} | loss {:.4f}{} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | {}{}{}{}".format(
+            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | {}{}{}{}".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
-                loss_breakdown_str,
                 log_data.metrics["grad_norm"],
                 log_data.metrics["lr"],
                 log_data.metrics["mem"],

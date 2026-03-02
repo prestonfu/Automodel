@@ -1007,6 +1007,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             logging.info("No clip_grad_norm.max_norm specified in config, using default value of 1.0")
             self.max_grad_norm = 1.0
 
+        # MoE load balancing: router_aux_loss_coef from model config (e.g. router_aux_loss_coef: 0.01)
+        model_cfg = self.cfg.model.get("config", None)
+        self.router_aux_loss_coef = float(
+            getattr(model_cfg, "router_aux_loss_coef", 0.0) if model_cfg is not None else 0.0
+        ) or 0.0
+        if self.router_aux_loss_coef > 0:
+            logging.info("MoE load balancing enabled: router_aux_loss_coef=%.4f", self.router_aux_loss_coef)
+
         # Create Checkpointer instance
         self.checkpointer = Checkpointer(
             config=checkpoint_config,
@@ -1120,7 +1128,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._bench_tflops = None
         if self._bench_cfg is not None:
             try:
-                seq_len = self.cfg.get("dataset.seq_len", None)
+                seq_len = self.cfg.get("dataset.seq_length", None)
                 global_batch_size = self.cfg.get("step_scheduler.global_batch_size", 1)
                 flops_formula = get_flops_formula_for_hf_config(self.model_parts[0].config)
                 flops = flops_formula(self.model_parts[0].config, gbs=global_batch_size, seq_len=seq_len)
@@ -1254,6 +1262,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_label_tokens,
         num_batches,
         is_train: bool = True,
+        ce_loss_buffer=None,
+        aux_loss_buffer=None,
     ):
         # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
         batch = {
@@ -1317,7 +1327,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else:
                     out = model(**batch)
 
-                local_loss = calculate_loss(
+                ce_loss = calculate_loss(
                     self.loss_fn,
                     logits=getattr(out, "logits", out),
                     labels=labels,
@@ -1325,7 +1335,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
                     num_label_tokens=num_label_tokens,
                 )
+                aux_loss_scaled = None
+                if self.router_aux_loss_coef > 0 and getattr(out, "aux_loss", None) is not None:
+                    aux_loss_scaled = self.router_aux_loss_coef * out.aux_loss
+                    local_loss = ce_loss + aux_loss_scaled
+                else:
+                    local_loss = ce_loss
                 loss_buffer.append(local_loss.clone().detach())
+                if ce_loss_buffer is not None:
+                    ce_loss_buffer.append(ce_loss.clone().detach())
+                if aux_loss_buffer is not None:
+                    aux_loss_buffer.append(
+                        aux_loss_scaled.clone().detach()
+                        if aux_loss_scaled is not None
+                        else torch.tensor(0.0, device=ce_loss.device, dtype=ce_loss.dtype)
+                    )
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
@@ -1353,12 +1377,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_batches = len(batches)
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
+        ce_loss_buffer = [] if self.router_aux_loss_coef > 0 and not self.pp_enabled else None
+        aux_loss_buffer = [] if self.router_aux_loss_coef > 0 and not self.pp_enabled else None
+
         for i, batch in enumerate(batches):
             if i == num_batches - 1:
                 prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
             self._forward_backward_step(
-                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+                i,
+                batch,
+                loss_buffer=loss_buffer,
+                num_label_tokens=num_label_tokens,
+                num_batches=num_batches,
+                ce_loss_buffer=ce_loss_buffer,
+                aux_loss_buffer=aux_loss_buffer,
             )
 
         grad_norm = scale_grads_and_clip_grad_norm(
@@ -1424,7 +1457,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 torch.distributed.recv(reporting_loss, src=src_rank)
 
         reporting_loss = reporting_loss.cpu().item()
-        # fix reporting_loss, tps across ranks
+
+        reporting_ce_loss = None
+        reporting_aux_loss = None
+        if ce_loss_buffer is not None and aux_loss_buffer is not None:
+            reporting_ce_loss = torch.sum(torch.stack(ce_loss_buffer))
+            reporting_aux_loss = torch.sum(torch.stack(aux_loss_buffer))
+            reporting_ce_loss = self._dp_allreduce(reporting_ce_loss, include_cp=True)
+            reporting_aux_loss = self._dp_allreduce(reporting_aux_loss, include_cp=True)
+            if self.pp_enabled:
+                reporting_ce_loss = reporting_ce_loss / num_label_tokens
+                reporting_aux_loss = reporting_aux_loss / num_label_tokens
+            reporting_ce_loss = reporting_ce_loss.cpu().item()
+            reporting_aux_loss = reporting_aux_loss.cpu().item()
 
         metrics = {
             "loss": reporting_loss,
@@ -1436,6 +1481,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "num_tokens_per_step": num_tokens_in_batch,
             "num_label_tokens": num_label_tokens,
         }
+        if reporting_ce_loss is not None and reporting_aux_loss is not None:
+            metrics["loss_ce"] = reporting_ce_loss
+            metrics["loss_aux"] = reporting_aux_loss
+
+        # MoE expert load balance metrics (works with PP — reads from local model parts)
+        if self.router_aux_loss_coef > 0:
+            from nemo_automodel.components.moe.layers import Gate
+
+            load_cvs = []
+            for part in self.model_parts:
+                for module in part.modules():
+                    if isinstance(module, Gate) and module._cumulative_expert_load is not None:
+                        load = module._cumulative_expert_load.float()
+                        cv = load.std() / (load.mean() + 1e-8)
+                        load_cvs.append(cv.item())
+                        module._cumulative_expert_load = None
+            if load_cvs:
+                metrics["expert_load_cv"] = sum(load_cvs) / len(load_cvs)
 
         if getattr(self, "_bench_tflops", None) is not None and getattr(self, "_bench_cfg", None) is not None:
             peak_tflops = self._bench_cfg.get("peak_tflops", None)
@@ -1592,11 +1655,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 eta_str = " | eta {:.1f}m".format(eta_seconds / 60)
             else:
                 eta_str = " | eta {:.0f}s".format(eta_seconds)
+        loss_breakdown_str = ""
+        if "loss_ce" in log_data.metrics and "loss_aux" in log_data.metrics:
+            loss_breakdown_str = " | loss_ce {:.4f} | loss_aux {:.4f}".format(
+                log_data.metrics["loss_ce"], log_data.metrics["loss_aux"]
+            )
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}{}{}".format(
+            "step {} | epoch {} | loss {:.4f}{} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}{}{}".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
+                loss_breakdown_str,
                 log_data.metrics["grad_norm"],
                 log_data.metrics["lr"],
                 log_data.metrics["mem"],

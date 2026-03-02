@@ -241,7 +241,7 @@ class _IndexReader:
     """
 
     def __init__(self, idx_path: str, multimodal: bool) -> None:
-        logger.info("Loading index file %s", idx_path)
+        logger.debug("Loading index file %s", idx_path)
 
         with open(idx_path, "rb") as f:
             header = f.read(9)
@@ -263,18 +263,18 @@ class _IndexReader:
         self._buffer = memoryview(self._mmap)
 
         # extract views
-        logger.info("Extracting sequence lengths")
+        logger.debug("Extracting sequence lengths")
         self.sequence_lengths = numpy.frombuffer(
             self._buffer, dtype=numpy.int32, count=self.sequence_count, offset=payload_offset
         )
-        logger.info("Extracting sequence pointers")
+        logger.debug("Extracting sequence pointers")
         self.sequence_pointers = numpy.frombuffer(
             self._buffer,
             dtype=numpy.int64,
             count=self.sequence_count,
             offset=payload_offset + self.sequence_lengths.nbytes,
         )
-        logger.info("Extracting document indices")
+        logger.debug("Extracting document indices")
         self.document_indices = numpy.frombuffer(
             self._buffer,
             dtype=numpy.int64,
@@ -284,7 +284,7 @@ class _IndexReader:
 
         self.sequence_modes: Optional[numpy.ndarray] = None
         if multimodal:
-            logger.info("Extracting sequence modes")
+            logger.debug("Extracting sequence modes")
             self.sequence_modes = numpy.frombuffer(
                 self._buffer,
                 dtype=numpy.int8,
@@ -299,7 +299,7 @@ class _IndexReader:
         assert self.sequence_lengths.shape[0] == self.sequence_count
         assert self.sequence_lengths.shape[0] == self.document_indices[-1]
 
-        logger.info("Sequences: %d | Documents: %d", len(self), self.document_indices.shape[0] - 1)
+        logger.debug("Sequences: %d | Documents: %d", len(self), self.document_indices.shape[0] - 1)
 
     def __del__(self) -> None:
         """Clean up the object"""

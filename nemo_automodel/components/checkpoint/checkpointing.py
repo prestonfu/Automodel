@@ -348,7 +348,13 @@ class Checkpointer:
             model_class = model.config.architectures[0]
         except:
             model_class = ""
-        if model_class not in ["Gemma3ForConditionalGeneration", "NemotronHForCausalLM"]:
+        # NemotronH's _init_weights uses copy_() on dt_bias which fails with DTensors.
+        # Skip only for finetuning (load_base_model=True) where pretrained weights overwrite init.
+        # For pretraining from scratch (load_base_model=False), init is needed.
+        skip_init_classes = ["Gemma3ForConditionalGeneration"]
+        if load_base_model:
+            skip_init_classes.append("NemotronHForCausalLM")
+        if model_class not in skip_init_classes:
             for _, module in model.named_modules():
                 if hasattr(module, "_is_hf_initialized"):
                     module._is_hf_initialized = False

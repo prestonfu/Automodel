@@ -738,7 +738,7 @@ class Gate(nn.Module):
         if self.bias_update_factor > 0 or self.aux_loss_coeff > 0:
             expert_load = self._compute_expert_load(indices, token_mask)
 
-        if self.bias_update_factor > 0 and self.training:
+        if (self.bias_update_factor > 0 or self.aux_loss_coeff > 0) and self.training:
             if self._cumulative_expert_load is None:
                 self._cumulative_expert_load = expert_load.detach()
             else:

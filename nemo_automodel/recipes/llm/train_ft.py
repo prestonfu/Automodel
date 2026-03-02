@@ -1137,6 +1137,35 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             except Exception as e:
                 logger.warning(f"Could not compute TFLOPs for MFU: {e}")
 
+        # Register expert load tracking hooks for HF routers (e.g. NemotronHTopkRouter)
+        if self.router_aux_loss_coef > 0:
+            self._register_expert_load_hooks()
+
+    def _register_expert_load_hooks(self):
+        """Register forward hooks on HF MoE routers to track expert load."""
+        count = 0
+        for part in self.model_parts:
+            for module in part.modules():
+                if type(module).__name__ == "NemotronHTopkRouter":
+                    module._cumulative_expert_load = None
+                    module.register_forward_hook(self._expert_load_hook)
+                    count += 1
+        if count > 0:
+            logging.info("Registered expert load hooks on %d NemotronHTopkRouter modules", count)
+
+    @staticmethod
+    def _expert_load_hook(module, input, output):
+        """Forward hook that accumulates expert load from router outputs."""
+        topk_idx, topk_weight = output
+        n_experts = module.n_routed_experts
+        expert_mask = topk_idx.new_zeros(topk_idx.shape[0], n_experts)
+        expert_mask.scatter_(1, topk_idx, 1)
+        expert_load = expert_mask.sum(dim=0).float()
+        if module._cumulative_expert_load is None:
+            module._cumulative_expert_load = expert_load.detach()
+        else:
+            module._cumulative_expert_load += expert_load.detach()
+
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
             return None, None, None
@@ -1191,6 +1220,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         for mp in self.model_parts:
             mp.train()
         self.timestamp = time.perf_counter()
+        self._total_tokens_trained = 0
 
         # nsys profiling config (from benchmark section)
         _bench_cfg = getattr(self, "_bench_cfg", None)
@@ -1471,6 +1501,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             reporting_ce_loss = reporting_ce_loss.cpu().item()
             reporting_aux_loss = reporting_aux_loss.cpu().item()
 
+        self._total_tokens_trained += num_tokens_in_batch
         metrics = {
             "loss": reporting_loss,
             "grad_norm": grad_norm,
@@ -1478,27 +1509,33 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "mem": torch.cuda.max_memory_allocated() / 1024**3,
             "tps": tps,
             "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
+            "step_time": time_delta,
             "num_tokens_per_step": num_tokens_in_batch,
             "num_label_tokens": num_label_tokens,
+            "total_tokens_trained": self._total_tokens_trained,
         }
         if reporting_ce_loss is not None and reporting_aux_loss is not None:
             metrics["loss_ce"] = reporting_ce_loss
             metrics["loss_aux"] = reporting_aux_loss
 
         # MoE expert load balance metrics (works with PP — reads from local model parts)
+        # Supports both nemo_automodel Gate and HF NemotronHTopkRouter (via forward hooks)
         if self.router_aux_loss_coef > 0:
-            from nemo_automodel.components.moe.layers import Gate
-
             load_cvs = []
+            expert_loads = []
             for part in self.model_parts:
                 for module in part.modules():
-                    if isinstance(module, Gate) and module._cumulative_expert_load is not None:
+                    if getattr(module, '_cumulative_expert_load', None) is not None:
                         load = module._cumulative_expert_load.float()
                         cv = load.std() / (load.mean() + 1e-8)
                         load_cvs.append(cv.item())
+                        expert_loads.append(load)
                         module._cumulative_expert_load = None
             if load_cvs:
                 metrics["expert_load_cv"] = sum(load_cvs) / len(load_cvs)
+            if expert_loads and self.step_scheduler.step % 50 == 0 and wandb.run is not None:
+                avg_load = torch.stack(expert_loads).mean(dim=0)
+                wandb.log({"expert_load_histogram": wandb.Histogram(avg_load.cpu().numpy())}, step=self.step_scheduler.step)
 
         if getattr(self, "_bench_tflops", None) is not None and getattr(self, "_bench_cfg", None) is not None:
             peak_tflops = self._bench_cfg.get("peak_tflops", None)
@@ -1647,21 +1684,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             log_data = replace(log_data, metrics={**log_data.metrics, "eta_seconds": eta_seconds})
         self.metric_logger_train.log(log_data)
         mfu_str = " | mfu {:.2f}%".format(log_data.metrics["mfu"]) if "mfu" in log_data.metrics else ""
-        eta_str = ""
-        if eta_seconds is not None:
-            if eta_seconds >= 3600:
-                eta_str = " | eta {:.1f}h".format(eta_seconds / 3600)
-            elif eta_seconds >= 60:
-                eta_str = " | eta {:.1f}m".format(eta_seconds / 60)
-            else:
-                eta_str = " | eta {:.0f}s".format(eta_seconds)
         loss_breakdown_str = ""
         if "loss_ce" in log_data.metrics and "loss_aux" in log_data.metrics:
             loss_breakdown_str = " | loss_ce {:.4f} | loss_aux {:.4f}".format(
                 log_data.metrics["loss_ce"], log_data.metrics["loss_aux"]
             )
+        step_time_str = " | step_time {:.2f}s".format(log_data.metrics["step_time"]) if "step_time" in log_data.metrics else ""
+        expert_cv_str = " | expert_cv {:.2f}".format(log_data.metrics["expert_load_cv"]) if "expert_load_cv" in log_data.metrics else ""
+        tps = log_data.metrics["tps"]
+        tps_per_gpu = log_data.metrics["tps_per_gpu"]
+        tps_str = "tps {:.2f}({:.2f}/gpu)".format(tps, tps_per_gpu) if tps != tps_per_gpu else "tps {:.2f}".format(tps)
         logging.info(
-            "step {} | epoch {} | loss {:.4f}{} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}{}{}".format(
+            "step {} | epoch {} | loss {:.4f}{} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | {}{}{}{}".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
@@ -1669,13 +1703,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 log_data.metrics["grad_norm"],
                 log_data.metrics["lr"],
                 log_data.metrics["mem"],
-                log_data.metrics["tps"],
-                log_data.metrics["tps_per_gpu"],
-                log_data.metrics["num_label_tokens"],
+                tps_str,
+                step_time_str,
                 mfu_str,
-                eta_str,
+                expert_cv_str,
             )
         )
+        if log_data.step == 2 and eta_seconds is not None:
+            if eta_seconds >= 3600:
+                logging.info("Estimated time to completion: {:.1f}h".format(eta_seconds / 3600))
+            elif eta_seconds >= 60:
+                logging.info("Estimated time to completion: {:.1f}m".format(eta_seconds / 60))
+            else:
+                logging.info("Estimated time to completion: {:.0f}s".format(eta_seconds))
         torch.cuda.reset_peak_memory_stats()
 
 

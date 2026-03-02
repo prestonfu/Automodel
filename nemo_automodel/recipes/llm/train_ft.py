@@ -42,6 +42,7 @@ from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
@@ -1198,11 +1199,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Switch-style aux loss: n_experts * sum(f_i * P_i)
         f = (expert_load / n_tokens).detach()
         P = scores.mean(dim=0)
-        aux_loss = n_experts * torch.sum(f * P)
+        aux_loss = router_aux_loss_coef * n_experts * torch.sum(f * P)
 
-        # Inject gradient
-        scaled = aux_loss * router_aux_loss_coef
-        output = output + (scaled - scaled.detach())
+        # Scale by n_tokens to compensate for per-token loss normalization.
+        output = MoEAuxLossAutoScaler.apply(output, aux_loss * n_tokens)
         return output
 
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
@@ -1711,17 +1711,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         tps_per_gpu = log_data.metrics["tps_per_gpu"]
         tps_str = "tps {:.2f}({:.2f}/gpu)".format(tps, tps_per_gpu) if tps != tps_per_gpu else "tps {:.2f}".format(tps)
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | {}{}{}{}".format(
+            "step {} | epoch {} | loss {:.4f}{} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | {}{}{}".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
+                expert_cv_str,
                 log_data.metrics["grad_norm"],
                 log_data.metrics["lr"],
                 log_data.metrics["mem"],
                 tps_str,
                 step_time_str,
                 mfu_str,
-                expert_cv_str,
             )
         )
         if log_data.step == 2 and eta_seconds is not None:

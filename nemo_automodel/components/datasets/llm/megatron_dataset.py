@@ -126,6 +126,22 @@ class MegatronPretraining:
                 paths = blend_config_or_none
             else:
                 paths = get_list_of_files(paths)
+        if isinstance(paths, dict):
+            # Expand globs in dict blend lists before validation
+            def _get_split_paths(key: str) -> Optional[List]:
+                val = paths.get(key)
+                if val is not None:
+                    return val
+                for alias in ("valid", "val", "dev"):
+                    if key == "validation" and paths.get(alias) is not None:
+                        return paths.get(alias)
+                return None
+
+            paths = {
+                "train": expand_globs_in_blend_list(_get_split_paths("train")),
+                "validation": expand_globs_in_blend_list(_get_split_paths("validation")),
+                "test": expand_globs_in_blend_list(_get_split_paths("test")),
+            }
         validate_dataset_asset_accessibility(paths)
 
         if isinstance(split, (list, tuple)):
@@ -314,7 +330,8 @@ def validate_dataset_asset_accessibility(paths):
         return
     elif isinstance(paths, dict):
         for p in paths.values():
-            validate_dataset_asset_accessibility(p)
+            if p is not None:
+                validate_dataset_asset_accessibility(p)
         return
 
     if not isinstance(paths, str) and not isinstance(paths, Path):
@@ -338,6 +355,40 @@ def validate_dataset_asset_accessibility(paths):
             raise FileNotFoundError(f"Expected {str(file_path)} to exist.")
         if not os.access(file_path, os.R_OK):
             raise PermissionError(f"Expected {str(file_path)} to be readable.")
+
+
+def expand_globs_in_blend_list(blend_list: Optional[List]) -> Optional[List]:
+    """
+    Expand glob patterns in a blend list. For weighted lists [w1, p1, w2, p2, ...],
+    each path that contains a glob is expanded and the weight is replicated for each
+    expanded path. For simple lists [p1, p2, ...], globs are expanded in place.
+    """
+    if blend_list is None:
+        return None
+    if not blend_list:
+        return blend_list
+
+    if is_zipped_list(blend_list):
+        # Weighted: [w1, p1, w2, p2, ...]
+        result = []
+        for i in range(0, len(blend_list), 2):
+            weight, path = blend_list[i], blend_list[i + 1]
+            if isinstance(path, str) and glob.has_magic(path):
+                expanded = get_list_of_files(path)
+                for p in expanded:
+                    result.extend([weight, p])
+            else:
+                result.extend([weight, path])
+        return result
+    else:
+        # Simple: [p1, p2, ...]
+        result = []
+        for path in blend_list:
+            if isinstance(path, str) and glob.has_magic(path):
+                result.extend(get_list_of_files(path))
+            else:
+                result.append(path)
+        return result
 
 
 def get_list_of_files(path: str):

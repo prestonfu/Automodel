@@ -637,32 +637,32 @@ class GPTDataset(torch.utils.data.Dataset):
             t_end = time.time()
             logger.debug(f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
-            logger.info(f"> total number of samples: {sample_index.shape[0] - 1}")
-            logger.info(f"> total number of epochs: {num_epochs}")
+            logger.debug(f"> total number of samples: {sample_index.shape[0] - 1}")
+            logger.debug(f"> total number of epochs: {num_epochs}")
 
             return document_index, sample_index, shuffle_index
 
-        logger.info(f"Load the {type(self).__name__} {self.index_split.name} indices")
+        logger.debug(f"Load the {type(self).__name__} {self.index_split.name} indices")
 
-        logger.info(f"\tLoad the document index from {os.path.basename(path_to_document_index)}")
+        logger.debug(f"\tLoad the document index from {os.path.basename(path_to_document_index)}")
         t_beg = time.time()
         document_index = numpy.load(path_to_document_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         logger.debug(f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
-        logger.info(f"\tLoad the sample index from {os.path.basename(path_to_sample_index)}")
+        logger.debug(f"\tLoad the sample index from {os.path.basename(path_to_sample_index)}")
         t_beg = time.time()
         sample_index = numpy.load(path_to_sample_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         logger.debug(f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
-        logger.info(f"\tLoad the shuffle index from {os.path.basename(path_to_shuffle_index)}")
+        logger.debug(f"\tLoad the shuffle index from {os.path.basename(path_to_shuffle_index)}")
         t_beg = time.time()
         shuffle_index = numpy.load(path_to_shuffle_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         logger.debug(f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
-        logger.info(f"> total number of samples: {sample_index.shape[0] - 1}")
+        logger.debug(f"> total number of samples: {sample_index.shape[0] - 1}")
 
         return document_index, sample_index, shuffle_index
 

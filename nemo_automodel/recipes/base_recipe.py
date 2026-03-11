@@ -205,7 +205,15 @@ class BaseRecipe:
                 torch.distributed.barrier()
 
         path = self.checkpointer.config.checkpoint_dir
-        path = os.path.join(path, f"epoch_{epoch}_step_{step}")
+        try:
+            import wandb
+            run_id = wandb.run.id if wandb.run is not None else None
+        except Exception:
+            run_id = None
+        if run_id:
+            path = os.path.join(path, f"{run_id}_epoch_{epoch}_step_{step}")
+        else:
+            path = os.path.join(path, f"epoch_{epoch}_step_{step}")
 
         best_val_metric = (
             val_loss[next(iter(val_loss.keys())) if len(val_loss) == 1 else best_metric_key] if val_loss else None
@@ -333,11 +341,13 @@ class BaseRecipe:
 
         if restore_from:
             ckpt_dir = restore_from
-        else:
+        elif getattr(self.checkpointer.config, "auto_resume", False):
             # Determine the latest checkpoint directory (e.g. ".../step_42").
             ckpt_dir = _find_latest_checkpoint(self.checkpointer.config.checkpoint_dir)
             if ckpt_dir is None:
                 return
+        else:
+            return
 
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)

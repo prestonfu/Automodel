@@ -402,7 +402,7 @@ class BlendedMegatronDatasetBuilder:
                             prefixes[0], split_spoof, sizes_spoof
                         )[i]
                         continue
-                    elif self.config.multiple_validation_sets and i == Split.valid.value:
+                    elif getattr(self.config, "multiple_validation_sets", False) and i == Split.valid.value:
                         # handle multiple validation sets
                         validation_datasets = []
                         if self.config.full_validation:

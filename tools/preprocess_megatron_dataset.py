@@ -17,6 +17,7 @@
 """Processing large data for pretraining."""
 
 import argparse
+import concurrent.futures
 import json
 import os
 import sys
@@ -25,6 +26,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.
 import glob
 import multiprocessing
 import time
+
+from tqdm import tqdm
 
 try:
     import nltk
@@ -74,13 +77,25 @@ def parquet_row_iterator(file_path, text_column, batch_size=10000):
             yield json.dumps({"text": text_value.as_py()})
 
 
+def arrow_row_iterator(file_path, text_column):
+    """Iterate over Arrow IPC stream file rows, yielding JSON-like strings for each row."""
+    import pyarrow as pa
+
+    reader = pa.ipc.open_stream(file_path)
+    for batch in reader:
+        for text_value in batch.column(text_column):
+            yield json.dumps({"text": text_value.as_py()})
+
+
 class Encoder(object):
     def __init__(self, args):
         self.args = args
 
     def initializer(self):
         # Use Encoder class as a container for global data
-        Encoder.tokenizer = AutoTokenizer.from_pretrained(self.args.pretrained_model_name_or_path)
+        # Skip loading if already set (e.g. inherited from parent via fork)
+        if getattr(Encoder, 'tokenizer', None) is None:
+            Encoder.tokenizer = AutoTokenizer.from_pretrained(self.args.pretrained_model_name_or_path)
         if self.args.split_sentences:
             if not nltk_available:
                 print("NLTK is not available to split sentences.")
@@ -215,7 +230,8 @@ class Partition(object):
 
     def process_parquet_file(self, file_name):
         input_file_name, output_prefix = file_name
-        print("Opening parquet file:", input_file_name)
+        parquet_file = pq.ParquetFile(input_file_name)
+        total_rows = parquet_file.metadata.num_rows
 
         startup_start = time.time()
         encoder = Encoder(self.args)
@@ -245,18 +261,67 @@ class Partition(object):
             )
 
         startup_end = time.time()
-        proc_start = time.time()
-        total_bytes_processed = 0
         print("Time to startup:", startup_end - startup_start)
-        for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
-            total_bytes_processed += bytes_processed
+        basename = os.path.basename(input_file_name)
+        pbar = tqdm(encoded_docs, total=total_rows, desc=basename,
+                    position=self.args.tqdm_position, leave=True, dynamic_ncols=True, unit=" docs")
+        for doc, sentence_lens, bytes_processed in pbar:
             for key in doc.keys():
                 builders[key].add_document(doc[key], sentence_lens[key])
-            self.print_processing_stats(i, proc_start, total_bytes_processed, source=input_file_name)
 
         pool.close()
         pool.join()
         builders[key].finalize(output_idx_files[key])
+
+    def process_arrow_file(self, file_name):
+        import pyarrow as pa
+
+        input_file_name, output_prefix = file_name
+
+        encoder = Encoder(self.args)
+        tokenizer = Encoder.tokenizer if getattr(Encoder, 'tokenizer', None) is not None else AutoTokenizer.from_pretrained(self.args.pretrained_model_name_or_path)
+
+        if self.workers > 1:
+            pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
+            row_iterator = arrow_row_iterator(input_file_name, self.args.text_column)
+            encoded_docs = pool.imap(encoder.encode, row_iterator, 32)
+        else:
+            encoder.initializer()
+            row_iterator = arrow_row_iterator(input_file_name, self.args.text_column)
+            encoded_docs = map(encoder.encode, row_iterator)
+            pool = None
+
+        level = "document"
+        if self.args.split_sentences:
+            level = "sentence"
+
+        output_bin_files = {}
+        output_idx_files = {}
+        builders = {}
+
+        for key in self.args.json_keys:
+            output_bin_files[key] = "{}_{}_{}.bin".format(output_prefix, key, level)
+            output_idx_files[key] = "{}_{}_{}.idx".format(output_prefix, key, level)
+            builders[key] = indexed_dataset.IndexedDatasetBuilder(
+                output_bin_files[key],
+                dtype=indexed_dataset.DType.optimal_dtype(len(tokenizer)),
+            )
+
+        for doc, sentence_lens, bytes_processed in encoded_docs:
+            for key in doc.keys():
+                builders[key].add_document(doc[key], sentence_lens[key])
+
+        if pool is not None:
+            pool.close()
+            pool.join()
+        builders[key].finalize(output_idx_files[key])
+
+
+def _process_arrow_wrapper(args_and_item):
+    """Top-level wrapper so ProcessPoolExecutor can pickle it."""
+    args, file_name = args_and_item
+    partition = Partition(args, workers=1)
+    partition.process_arrow_file(file_name)
 
 
 def get_args():
@@ -269,7 +334,7 @@ def get_args():
     group.add_argument(
         "--input-type",
         type=str,
-        choices=["json", "parquet", "auto"],
+        choices=["json", "parquet", "arrow", "auto"],
         default="auto",
         help="Input file type. 'auto' detects from file extension (default: auto)",
     )
@@ -312,6 +377,7 @@ def get_args():
         help=("Number of worker processes to launch. Workers are divided across matched input files."),
     )
     group.add_argument("--log-interval", type=int, default=1000, help="Interval between progress updates")
+    group.add_argument("--tqdm-position", type=int, default=0, help="tqdm bar position (for parallel processes)")
     group.add_argument("--pretrained-model-name-or-path", type=str, required=True, help="Pretrained model name or path")
     args = parser.parse_args()
     return args
@@ -322,6 +388,8 @@ def detect_file_type(file_path):
     ext = os.path.splitext(file_path)[1].lower()
     if ext in [".parquet", ".pq"]:
         return "parquet"
+    elif ext == ".arrow":
+        return "arrow"
     elif ext in [".json", ".jsonl"]:
         return "json"
     else:
@@ -365,16 +433,20 @@ def main():
     else:
         file_type = args.input_type
 
-    # Check parquet availability if needed
-    if file_type == "parquet" and not parquet_available:
+    # Check pyarrow availability if needed
+    if file_type in ("parquet", "arrow") and not parquet_available:
         raise Exception(
-            "pyarrow library is required for parquet files but is not available. Install with: pip install pyarrow"
+            "pyarrow library is required for parquet/arrow files but is not available. Install with: pip install pyarrow"
         )
 
-    # For parquet files, sentence splitting is not supported (text is already in a single column)
-    if file_type == "parquet" and args.split_sentences:
+    # For parquet/arrow files, sentence splitting is not supported (text is already in a single column)
+    if file_type in ("parquet", "arrow") and args.split_sentences:
         print("Warning: Sentence splitting for parquet files is not currently supported. Ignoring --split-sentences.")
         args.split_sentences = False
+
+    # Preload tokenizer in the main process so forked children inherit it
+    # instead of each independently loading from disk/network.
+    Encoder.tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model_name_or_path)
 
     workers_per_file = max(1, args.workers // len(in_file_names))
     partition = Partition(args, workers_per_file)
@@ -397,38 +469,67 @@ def main():
         # Optional sentence splitting per file (JSON only)
         split_sentences_present = check_files_exist(in_ss_out_names, "sentence_split", len(in_ss_out_names))
         if args.split_sentences and not split_sentences_present:
-            processes = []
             for name in in_ss_out_names:
-                p = multiprocessing.Process(
-                    target=partition.split_sentences, args=((name["partition"], name["sentence_split"]),)
-                )
-                p.start()
-                processes.append(p)
-            for p in processes:
-                p.join()
+                partition.split_sentences((name["partition"], name["sentence_split"]))
 
-        # Encode each file independently
-        processes = []
         input_key = "sentence_split" if args.split_sentences else "partition"
-        for name in in_ss_out_names:
-            p = multiprocessing.Process(
-                target=partition.process_json_file, args=((name[input_key], name["output_prefix"]),)
-            )
-            p.start()
-            processes.append(p)
-        for p in processes:
-            p.join()
+        process_fn = partition.process_json_file
+    elif file_type == "parquet":
+        input_key = "partition"
+        process_fn = partition.process_parquet_file
+    elif file_type == "arrow":
+        input_key = "partition"
+        process_fn = partition.process_arrow_file
     else:
-        # Parquet processing
-        processes = []
-        for name in in_ss_out_names:
-            p = multiprocessing.Process(
-                target=partition.process_parquet_file, args=((name["partition"], name["output_prefix"]),)
-            )
-            p.start()
-            processes.append(p)
-        for p in processes:
-            p.join()
+        print(f"Unknown file type: {file_type}")
+        return
+
+    # Build work items
+    work_items = [(name[input_key], name["output_prefix"]) for name in in_ss_out_names]
+    total_files = len(work_items)
+
+    if file_type == "arrow" and total_files > 1:
+        # Parallel: each worker processes one file single-threaded
+        max_concurrent = min(total_files, args.workers)
+        pbar = tqdm(total=total_files, desc="Files processed", unit=" files",
+                    position=0, dynamic_ncols=True)
+        executor = concurrent.futures.ProcessPoolExecutor(max_workers=max_concurrent)
+        try:
+            futures = {
+                executor.submit(_process_arrow_wrapper, (args, item)): item[0]
+                for item in work_items
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as e:
+                    print(f"\nError processing {futures[fut]}: {e}", file=sys.stderr)
+                pbar.update(1)
+        except KeyboardInterrupt:
+            print("\n\nInterrupted! Shutting down workers...", file=sys.stderr)
+            executor.shutdown(wait=False, cancel_futures=True)
+            for p in multiprocessing.active_children():
+                p.terminate()
+            sys.exit(1)
+        finally:
+            pbar.close()
+            executor.shutdown(wait=True)
+    else:
+        # Sequential with internal parallelism (json/parquet or single file)
+        pbar = tqdm(total=total_files, desc="Files processed", unit=" files",
+                    position=0, dynamic_ncols=True)
+        try:
+            for item in work_items:
+                process_fn(item)
+                pbar.update(1)
+        except KeyboardInterrupt:
+            print("\n\nInterrupted!", file=sys.stderr)
+            for p in multiprocessing.active_children():
+                p.terminate()
+            sys.exit(1)
+        finally:
+            pbar.close()
+
     return
 
 

@@ -1,0 +1,161 @@
+# torchrun --nproc-per-node=8 examples/llm_pretrain/pretrain.py --config examples/llm_pretrain/nemotron_nano_v3_pretrain.yaml
+
+benchmark:
+  warmup_steps: 5
+  peak_tflops: 989  # H100: 989, A100: 312
+  nsys_start: -1
+  nsys_end: -1
+  nsys_ranks: []
+  num_nodes: 1
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.AutoConfig.from_pretrained
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    trust_remote_code: true
+    router_aux_loss_coef: 0.0001
+  trust_remote_code: true
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  paths:
+    train:
+      # CC subsets (6 present: High-Quality, -Synthetic, -DQA, -Translated*, Medium-High-Quality)
+      - "8.6"
+      - /mnt/pretrain_data/megatron/nemotron_cc_v2.1/train/High-Quality_*_text_document*
+      - "26.7"
+      - /mnt/pretrain_data/megatron/nemotron_cc_v2.1/train/High-Quality-Synthetic_*_text_document*
+      - "5.5"
+      - /mnt/pretrain_data/megatron/nemotron_cc_v2.1/train/High-Quality-DQA_*_text_document*
+      - "2.2"
+      - /mnt/pretrain_data/megatron/nemotron_cc_v2.1/train/High-Quality-Translated-To-English_*_text_document*
+      - "2.2"
+      - /mnt/pretrain_data/megatron/nemotron_cc_v2.1/train/High-Quality-Translated-To-English-Synthetic_*_text_document*
+      - "6.4"
+      - /mnt/pretrain_data/megatron/nemotron_cc_v2.1/train/Medium-High-Quality_*_text_document*
+      # Code subsets (all 5 present)
+      - "18.3"
+      - /mnt/pretrain_data/megatron/nemotron_code_v2/train/Synthetic-Question-Answering_*_text_document*
+      - "2.2"
+      - /mnt/pretrain_data/megatron/nemotron_code_v2/train/Synthetic-Student-Teacher_*_text_document*
+      - "2.2"
+      - /mnt/pretrain_data/megatron/nemotron_code_v2/train/Synthetic-Code-Review_*_text_document*
+      - "1.1"
+      - /mnt/pretrain_data/megatron/nemotron_code_v2/train/Synthetic-Rewriting_*_text_document*
+      - "1.1"
+      - /mnt/pretrain_data/megatron/nemotron_code_v2/train/Synthetic-Transpilation_*_text_document*
+      # Specialized subsets (5 present; STEM-SFT missing)
+      - "12.4"
+      - /mnt/pretrain_data/megatron/nemotron_specialized_v1/train/Nemotron-Pretraining-Math-Textbooks_*_text_document*
+      - "4.1"
+      - /mnt/pretrain_data/megatron/nemotron_specialized_v1/train/Nemotron-Pretraining-Scientific-Coding_*_text_document*
+      - "4.1"
+      - /mnt/pretrain_data/megatron/nemotron_specialized_v1/train/Nemotron-Pretraining-RQA_*_text_document*
+      - "1.3"
+      - /mnt/pretrain_data/megatron/nemotron_specialized_v1/train/Nemotron-Pretraining-Wiki-Rewrite_*_text_document*
+      - "1.6"
+      - /mnt/pretrain_data/megatron/nemotron_specialized_v1/train/Nemotron-Pretraining-InfiniByte-Reasoning_*_text_document*
+    validation:
+      - /mnt/pretrain_data/megatron/nemotron_cc_v2.1/val/*_text_document*
+      - /mnt/pretrain_data/megatron/nemotron_code_v2/val/*_text_document*
+      - /mnt/pretrain_data/megatron/nemotron_specialized_v1/val/*_text_document*
+  index_mapping_dir: /mnt/pretrain_data/megatron/mapping_dir
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    trust_remote_code: true
+  seq_length: 2048
+  splits_to_build: "train"
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  paths:
+    validation:
+      - /mnt/pretrain_data/megatron/nemotron_cc_v2.1/val/*_text_document*
+      - /mnt/pretrain_data/megatron/nemotron_code_v2/val/*_text_document*
+      - /mnt/pretrain_data/megatron/nemotron_specialized_v1/val/*_text_document*
+  index_mapping_dir: /mnt/pretrain_data/megatron/mapping_dir
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    trust_remote_code: true
+  seq_length: 2048
+  splits_to_build: "validation"
+  num_val_samples: 1024
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 16
+  ckpt_every_steps: 6000
+  val_every_steps: 1000
+  num_epochs: 1
+  max_steps: 18500
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 1
+
+autopipeline:
+  _target_: nemo_automodel.components.distributed.pipelining.autopipeline.AutoPipeline
+  pp_schedule: 1f1b
+  pp_microbatch_size: 2
+  scale_grads_in_schedule: false
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+parallelizer:
+  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
+  activation_checkpointing: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /mnt/checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
+  load_base_model: false
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: 1
+  dp_replicate_size: 1
+  tp_size: 1
+  cp_size: 1
+  pp_size: 8
+  sequence_parallel: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.1
+
+lr_scheduler:
+  init_lr: 0.0
+  max_lr: 1.0e-4
+  min_lr: 1.0e-6
+  lr_warmup_steps: 320
+  lr_decay_steps: 9500
+  lr_decay_style: WSD
+  wsd_decay_steps: 1900
+  lr_wsd_decay_style: cosine
+
+wandb:
+  wandb_online: true
+  project: nemotron_nano_v3_pretrain
+  entity: prestonfu
+  name: nemotron_blend

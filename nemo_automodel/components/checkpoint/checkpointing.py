@@ -110,6 +110,62 @@ class CheckpointingConfig:
             self.is_async = False
 
 
+def _init_mamba_dt_bias_modules(mamba_modules, config):
+    """DTensor-safe initialization of NemotronHMamba2Mixer.dt_bias.
+
+    Replicates the logic from NemotronH's _init_weights for dt_bias,
+    but writes to the local tensor to avoid the DTensor copy_() error.
+    """
+    import math
+
+    for module in mamba_modules:
+        local = module.dt_bias.data
+        if hasattr(local, "to_local"):
+            local = local.to_local()
+        local_num_heads = local.shape[0]
+        dt = torch.exp(
+            torch.rand(local_num_heads)
+            * (math.log(config.time_step_max) - math.log(config.time_step_min))
+            + math.log(config.time_step_min)
+        ).clamp(min=config.time_step_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            local.copy_(inv_dt.to(local.device))
+        module.dt_bias._no_reinit = True
+        module.A_log._no_weight_decay = True
+        module.D._no_weight_decay = True
+
+
+def _init_framework_moe_modules(model, device):
+    """Initialize framework MoE modules that replaced HF MoE blocks.
+
+    HF's initialize_weights doesn't recognize GroupedExperts, Gate, ReLU2MLP, etc.,
+    so their parameters remain uninitialized after to_empty + initialize_weights.
+    """
+    from nemo_automodel.components.moe.layers import MoE
+
+    count = 0
+    for _, module in model.named_modules():
+        if isinstance(module, MoE):
+            module.init_weights(buffer_device=device)
+            count += 1
+    if count > 0:
+        logging.info("Initialized %d framework MoE modules", count)
+
+    # Diagnostic: find any parameters with inf/nan after all init
+    for name, p in model.named_parameters():
+        try:
+            local = p.data
+            if hasattr(local, "to_local"):
+                local = local.to_local()
+            if torch.isinf(local).any() or torch.isnan(local).any():
+                logging.warning("BAD PARAM after init: %s shape=%s dtype=%s inf=%d nan=%d",
+                    name, list(local.shape), local.dtype,
+                    torch.isinf(local).sum().item(), torch.isnan(local).sum().item())
+        except Exception as e:
+            logging.warning("Could not check param %s: %s", name, e)
+
+
 class Checkpointer:
     """
     High-level checkpoint manager built on torch.distributed.checkpoint (DCP).
@@ -359,6 +415,16 @@ class Checkpointer:
                 if hasattr(module, "_is_hf_initialized"):
                     module._is_hf_initialized = False
 
+            # NemotronH Mamba dt_bias workaround: HF's _init_weights does
+            # dt_bias.copy_(inv_dt) which fails when dt_bias is a DTensor
+            # (after FSDP wrapping). Mark dt_bias as already initialized so
+            # HF skips it, then manually init afterwards (DTensor-safe).
+            _mamba_modules = []
+            for _, module in model.named_modules():
+                if type(module).__name__ == "NemotronHMamba2Mixer" and hasattr(module, "dt_bias"):
+                    module.dt_bias._is_hf_initialized = True
+                    _mamba_modules.append(module)
+
             # init model weights
             if hasattr(model, "initialize_weights"):
                 model.initialize_weights()
@@ -366,6 +432,14 @@ class Checkpointer:
                 logging.warning(
                     "Warning: Model does not have initialize_weights method. Requires custom initialization to be implemented."
                 )
+
+            # Manually init dt_bias for Mamba modules (DTensor-safe)
+            if _mamba_modules:
+                _init_mamba_dt_bias_modules(_mamba_modules, model.config)
+
+            # Initialize framework MoE modules that replaced HF MoE blocks.
+            # HF's initialize_weights doesn't know about these modules.
+            _init_framework_moe_modules(model, device)
 
         # init peft adapters with the scaled weights
         _init_peft_adapters(model, peft_init_method)
@@ -581,7 +655,9 @@ class Checkpointer:
 
         # Add any missing keys from the model_state_dict
         # These will go to the same file as the last file (or file 1 for single-file models)
-        default_index = max(fqn_to_file_index_mapping.values())
+        # When all HF keys were removed (e.g. MoE modules replaced with framework modules),
+        # fall back to putting everything in shard 1.
+        default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
 
         # add any additional keys that are not in the base checkpoint
         for fqn in list(state_dict.keys()):

@@ -15,7 +15,7 @@ model:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
     trust_remote_code: true
-    router_aux_loss_coef: 0.0001
+    router_aux_loss_coef: 0.0001  # pp
     # Scaled-down architecture (~6B total / 1.2B active)
     hidden_size: 1792
     num_hidden_layers: 32
@@ -53,8 +53,8 @@ validation_dataset:
   num_val_samples: 1024
 
 step_scheduler:
-  global_batch_size: 32
-  local_batch_size: 16
+  global_batch_size: 128
+  local_batch_size: 8
   ckpt_every_steps: 6000
   val_every_steps: 250
   num_epochs: 1
@@ -66,11 +66,11 @@ dist_env:
   backend: nccl
   timeout_minutes: 1
 
-autopipeline:
-  _target_: nemo_automodel.components.distributed.pipelining.autopipeline.AutoPipeline
-  pp_schedule: 1f1b
-  pp_microbatch_size: 2
-  scale_grads_in_schedule: false
+# autopipeline:
+#   _target_: nemo_automodel.components.distributed.pipelining.autopipeline.AutoPipeline
+#   pp_schedule: 1f1b
+#   pp_microbatch_size: 2
+#   scale_grads_in_schedule: false
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
@@ -80,6 +80,7 @@ rng:
 parallelizer:
   _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
   activation_checkpointing: false
+  router_aux_loss_coef: 0.0001  # ep
 
 checkpoint:
   enabled: true
@@ -90,11 +91,11 @@ checkpoint:
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-  dp_size: 1
   dp_replicate_size: 1
   tp_size: 1
   cp_size: 1
-  pp_size: 8
+  ep_size: 8
+  pp_size: 1
   sequence_parallel: false
 
 loss_fn:

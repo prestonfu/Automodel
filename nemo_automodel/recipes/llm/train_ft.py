@@ -1017,6 +1017,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         ) or 0.0
         if self.router_aux_loss_coef > 0:
             logging.info("MoE load balancing enabled: router_aux_loss_coef=%.4f", self.router_aux_loss_coef)
+        self.log_expert_histogram = bool(self.cfg.get("log_expert_histogram", False))
 
         # Logging frequency (default: every step)
         self.log_every_steps = int(self.cfg.get("log_every_steps", 1))
@@ -1534,7 +1535,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         module._cumulative_expert_load = None
             if load_cvs:
                 metrics["expert_load_cv"] = sum(load_cvs) / len(load_cvs)
-            if expert_loads:
+            if expert_loads and self.log_expert_histogram:
                 metrics["_expert_load_tensor"] = torch.stack(expert_loads).mean(dim=0).cpu().tolist()
 
         if getattr(self, "_bench_tflops", None) is not None and getattr(self, "_bench_cfg", None) is not None:

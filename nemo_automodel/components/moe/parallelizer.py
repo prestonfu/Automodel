@@ -33,7 +33,9 @@ from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint
 from nemo_automodel.components.moe.layers import (
     GroupedExpertsDeepEP,
     MoE,
+    MoEConfig,
 )
+from nemo_automodel.components.moe.utils import BackendConfig
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
@@ -63,10 +65,71 @@ def _get_moe_module(block: nn.Module):
     if hasattr(block, 'block_sparse_moe') and hasattr(block.block_sparse_moe, 'moe_layer'):
         if isinstance(block.block_sparse_moe.moe_layer, MoE):
             return block.block_sparse_moe.moe_layer
-    # NemotronH: MoE is at block.mixer (NemotronHMOE), identified by block_type
+    # NemotronH: MoE is at block.mixer — either already replaced with framework MoE,
+    # or still the original HF NemotronHMOE (identified by block_type).
+    if hasattr(block, 'mixer') and isinstance(block.mixer, MoE):
+        return block.mixer
     if getattr(block, 'block_type', None) == 'moe' and hasattr(block, 'mixer'):
         return block.mixer
     return None
+
+
+class _MoEForwardAdapter(MoE):
+    """Wrapper that adapts framework MoE's forward signature to the
+    single-tensor interface expected by NemotronH blocks."""
+
+    def forward(self, hidden_states, **kwargs):
+        return super().forward(hidden_states)
+
+
+def replace_hf_moe_with_framework_moe(model: nn.Module, ep_size: int = 1, router_aux_loss_coef: float = 0.0):
+    """Replace HF NemotronHMOE modules with framework MoE for EP compatibility.
+
+    Only replaces blocks with block_type == 'moe' that are NOT already
+    framework MoE instances.
+    """
+    _model = _get_inner_model(model)
+    hf_config = getattr(model, 'config', None) or getattr(_model, 'config', None)
+    if hf_config is None:
+        return
+
+    # Only replace if blocks use the NemotronH pattern (block_type attribute)
+    replaced = 0
+    for layer_id, block in _model.layers.named_children():
+        if getattr(block, 'block_type', None) != 'moe':
+            continue
+        if isinstance(getattr(block, 'mixer', None), MoE):
+            continue  # already replaced
+
+        moe_config = MoEConfig(
+            n_routed_experts=hf_config.n_routed_experts,
+            n_shared_experts=getattr(hf_config, 'n_shared_experts', 1),
+            n_activated_experts=hf_config.num_experts_per_tok,
+            n_expert_groups=getattr(hf_config, 'n_group', 1),
+            n_limited_groups=getattr(hf_config, 'topk_group', 1),
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=router_aux_loss_coef,
+            score_func="sigmoid",
+            route_scale=getattr(hf_config, 'routed_scaling_factor', 1.0),
+            dim=hf_config.hidden_size,
+            inter_dim=getattr(hf_config, 'intermediate_size', hf_config.hidden_size),
+            moe_inter_dim=hf_config.moe_intermediate_size,
+            norm_topk_prob=getattr(hf_config, 'norm_topk_prob', True),
+            expert_activation="relu2",
+            shared_expert_inter_dim=getattr(hf_config, 'moe_shared_expert_intermediate_size', None),
+        )
+        backend = BackendConfig(
+            linear="torch",
+            enable_deepep=True,
+            ep_size=ep_size,
+        )
+        new_moe = _MoEForwardAdapter(moe_config, backend)
+        block.mixer = new_moe
+        replaced += 1
+
+    if replaced > 0:
+        logger.info(f"[replace_hf_moe_with_framework_moe] Replaced {replaced} NemotronH MoE blocks with framework MoE (ep_size={ep_size})")
 
 
 class ExpertParallel(ParallelStyle):
@@ -207,6 +270,16 @@ def apply_fsdp(
         ignored_params = None
         if moe_module is not None and ep_enabled:
             ignored_params = set(moe_module.experts.parameters())
+        elif moe_module is not None and not ep_enabled and hasattr(moe_module, 'experts'):
+            # No EP: experts live in a ModuleList (no forward()).
+            # Wrap each individual expert with FSDP first (each has forward()),
+            # then wrap the MoE module itself (also has forward()).
+            # The block-level wrap will see the MoE module as already-managed
+            # and skip it entirely via the DFS early-return.
+            if isinstance(moe_module.experts, nn.ModuleList):
+                for expert in moe_module.experts:
+                    fully_shard_default(expert)
+                fully_shard_default(moe_module)
 
         fully_shard_default(block, ignored_params=ignored_params)
 
@@ -286,6 +359,7 @@ def parallelize_model(
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
+    router_aux_loss_coef: float = 0.0,
 ):
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
         "Tensor parallelism not supported for custom MoE models"
@@ -298,6 +372,10 @@ def parallelize_model(
     ep_mesh = None
     if ep_axis_name is not None and moe_mesh is not None and ep_axis_name in moe_mesh.mesh_dim_names:
         ep_mesh = moe_mesh[ep_axis_name]
+
+    # Replace HF MoE modules (e.g. NemotronHMOE) with framework MoE for EP support.
+    ep_size = ep_mesh.size() if ep_mesh is not None else 1
+    replace_hf_moe_with_framework_moe(model, ep_size=ep_size, router_aux_loss_coef=router_aux_loss_coef)
 
     # Always apply EP initialization if an EP mesh is available, even when ep_size == 1.
     # DeepEP requires the EP process group / token dispatcher even in the non-sharded case.
